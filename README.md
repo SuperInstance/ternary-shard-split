@@ -1,70 +1,82 @@
-# ternary-shard-split
+# Ternary Shard Split — Distributed Training via Ternary Weight Sharding
 
-*Split ternary model weights across devices. Since {-1,0,+1} packs 16-to-a-u32, sharding is clean: every shard gets aligned data.*
+**Ternary Shard Split** partitions ternary model weights across multiple devices for distributed training. Since ternary weights pack 16-per-u32 (2 bits each), sharding is naturally aligned: each shard receives a multiple of 16 trits, ensuring clean boundaries in the packed representation.
 
-## Why This Exists
+## Why It Matters
 
-Distributed training with ternary weights (BitNet b1.58 style) has an advantage nobody talks about: the sharding math is trivial. Binary weights need bit-level alignment tricks. Float16 needs padding to 2-byte boundaries. Ternary packs exactly 16 trits per u32, so splitting across N devices means each shard gets a clean multiple of 16 — no padding, no waste, no misaligned accesses.
+Large ternary models can exceed single-GPU memory despite being 16× smaller than FP32. Sharding distributes the model across devices, enabling training of models that would otherwise be impossible. The ternary packing makes sharding especially clean: unlike float weights where arbitrary split points can misalign with cache lines, ternary shards always start and end on 16-trit (1-u32) boundaries. This eliminates the partial-word handling that complicates binary and float sharding schemes.
 
-This crate does the splitting, merging, and verification for distributed ternary training.
+## How It Works
 
-## Architecture
+### Even Split
+
+`split_even(trits, n)` divides trits into n shards as evenly as possible. For N trits and n shards, each shard gets ⌈N/n⌉ or ⌊N/n⌋ trits. The first `N mod n` shards get one extra trit. O(N) to split.
+
+### Aligned Split
+
+`split_aligned(trits, n)` ensures each shard boundary falls on a 16-trit boundary. Each shard (except the last) gets a multiple of 16 trits. This is critical for packed representation: shards can be directly loaded as u32 arrays without bit manipulation.
 
 ```
-Original Weights: [tttttttttttttttttttttttttttttttt]
-                                         ↓ split_even(N=4)
-Shard 0: [tttttttt]    Shard 1: [tttttttt]
-Shard 2: [tttttttt]    Shard 3: [tttttttt]
-                                         ↓ merge_shards
-Original Weights: [tttttttttttttttttttttttttttttttt] ✓
+aligned_base = ⌈(N / n + 15) / 16⌉ × 16
+shard[0..n-1].len = aligned_base
+shard[n-1].len = remaining (may be < aligned_base)
 ```
 
-### Key Types
+### Layer-Parallel Sharding
 
-- **`Shard`** — A slice of ternary weights with metadata (shard_id, total_shards, layer_name)
-- **`split_even(trits, N)`** — Split into N shards as evenly as possible (remainder distributed to first shards)
-- **`split_aligned(trits, N, align)`** — Split respecting packing alignment (every shard is a multiple of `align` trits)
-- **`merge_shards(shards)`** — Reconstruct original weights from shards
-- **`shard_stats(shards)`** — Balance metrics (min/max/avg shard size, imbalance ratio)
+`split_by_layers(layers, n)` distributes entire model layers across devices. Layer i goes to device `i mod n`. This enables pipeline parallelism: device 0 computes layer 0, passes output to device 1 for layer 1, etc. Each device holds only its assigned layers.
 
-### Design Decision: Even Distribution
+### Shard Metadata
 
-`split_even` gives the first `remainder` shards one extra trit. This means shards differ by at most 1 trit. For a 1M-trit model split across 8 GPUs, that's a 0.0008% imbalance — negligible for any practical workload.
+Each `Shard` carries:
+- `shard_id`: Which shard this is (0..n-1)
+- `total_shards`: Total number of shards
+- `trits`: The actual ternary weight data
+- `layer_name`: Which model layer (for layer-parallel)
 
-## Usage
+### Reconstruction
+
+Concatenating all shards in order reconstructs the original weight tensor. O(N) total.
+
+## Quick Start
 
 ```rust
-use ternary_shard_split::*;
+use ternary_shard_split::{split_even, split_aligned};
 
-let weights: Vec<i8> = vec![-1, 0, 1, -1, 1, 0, 0, 1, -1, 1, 0, -1, 1, 0, -1, 1];
+let trits: Vec<i8> = (0..1000).map(|i| match i % 3 { 0 => -1, 1 => 0, _ => 1 }).collect();
 
-// Split across 4 devices
-let shards = split_even(&weights, 4);
+// Even split across 4 devices
+let shards = split_even(&trits, 4);
 assert_eq!(shards.len(), 4);
+assert_eq!(shards.iter().map(|s| s.trits.len()).sum::<usize>(), 1000);
 
-// Each shard has its metadata
-assert_eq!(shards[0].shard_id, 0);
-assert_eq!(shards[0].total_shards, 4);
-
-// Merge back
-let reconstructed = merge_shards(&shards).unwrap();
-assert_eq!(reconstructed, weights);
-
-// Check balance
-let stats = shard_stats(&shards);
-assert!(stats.imbalance_ratio() < 0.1);
+// Aligned split (16-trit boundaries)
+let aligned = split_aligned(&trits, 4);
 ```
 
-## The Deeper Idea
+```bash
+cargo add ternary-shard-split
+```
 
-Ternary sharding is a microcosm of the SuperInstance architecture: the {-1, 0, +1} representation is simple enough that distributed systems problems become trivial. When your fundamental unit is 2 bits (packed into integers), alignment, padding, and load balancing all have clean closed-form solutions.
+## API
 
-This connects to `ternary-shard-merge` (the counterpart that merges shards with conflict resolution), `ternary-memory-pool` (device memory management), and `ternary-pipeline-parallel` (pipeline scheduling across sharded devices).
+| Type / Function | Description |
+|---|---|
+| `Shard` | `{ shard_id, total_shards, trits, layer_name }` |
+| `split_even(&[Trit], n)` | Even partition (O(N)) |
+| `split_aligned(&[Trit], n)` | 16-trit aligned partition |
+| `split_by_layers(layers, n)` | Layer-parallel distribution |
 
-## Related Crates
+## Architecture Notes
 
-- `ternary-pack` — Pack trits into u32 (the encoding this crate assumes)
-- `ternary-shard-merge` — Merge shards with conflict resolution
-- `ternary-pipeline-parallel` — Pipeline scheduling across sharded devices
-- `ternary-tensor-parallel` — Tensor parallelism for ternary layers
-- `ternary-memory-pool` — Device memory management for shards
+Shard split enables multi-GPU training in **SuperInstance**. Each GPU holds a shard of the ternary model; gradients are exchanged between shards during training. The γ + η = C conservation holds per-shard: each shard's active weights (γ) plus zero weights (η) equals the shard size C. Global conservation follows from summing across shards. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+
+## References
+
+- Shazeer, Noam et al. "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer," *ICLR*, 2017.
+- Rajbhandari, Samyam et al. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models," *SC*, 2020.
+| Huang, Yanping et al. "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism," *NeurIPS*, 2019.
+
+## License
+
+MIT
