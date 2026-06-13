@@ -77,6 +77,19 @@ Shard split enables multi-GPU training in **SuperInstance**. Each GPU holds a sh
 - Rajbhandari, Samyam et al. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models," *SC*, 2020.
 | Huang, Yanping et al. "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism," *NeurIPS*, 2019.
 
+
+
+## Complexity Summary
+
+| Operation | Time | Space |
+|---|---|---|
+| split_even(N trits, n shards) | O(N) | O(N) |
+| split_aligned(N trits, n shards) | O(N) | O(N) |
+| split_by_layers(L layers, n devices) | O(L) | O(L) |
+| Reconstruction (concat shards) | O(N) | O(N) |
+
+Aligned splitting adds O(16) padding overhead per shard in the worst case, negligible for models with millions of weights.
+
 ## License
 
 MIT
