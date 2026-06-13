@@ -1,94 +1,140 @@
-# Ternary Shard Split — Distributed Training via Ternary Weight Sharding
+# ternary-shard-split
 
-**Ternary Shard Split** partitions ternary model weights across multiple devices for distributed training. Since ternary weights pack 16-per-u32 (2 bits each), sharding is naturally aligned: each shard receives a multiple of 16 trits, ensuring clean boundaries in the packed representation.
+Shard **ternary model weights** across multiple devices for distributed training. Since ternary weights pack 16 trits per `u32`, sharding is naturally aligned: each shard gets a multiple of 16 trits, maintaining packed-representation alignment with zero padding waste.
 
 ## Why It Matters
 
-Large ternary models can exceed single-GPU memory despite being 16× smaller than FP32. Sharding distributes the model across devices, enabling training of models that would otherwise be impossible. The ternary packing makes sharding especially clean: unlike float weights where arbitrary split points can misalign with cache lines, ternary shards always start and end on 16-trit (1-u32) boundaries. This eliminates the partial-word handling that complicates binary and float sharding schemes.
+Ternary neural networks (e.g., BitNet, TernaryBERT) store weights as trits ∈ {-1, 0, +1}, packing 16 into a single 32-bit integer. When training across N GPUs, naive sharding can split mid-pack, corrupting the packed representation. This crate provides:
+
+1. **`split_even`** — Equal-size shards (handle remainder)
+2. **`split_aligned`** — 16-trit-aligned shards (packed-representation safe)
+3. **`split_by_layers`** — Layer-parallel sharding (whole layers per device)
+4. **`merge` / `validate`** — Reconstruct and verify
 
 ## How It Works
 
 ### Even Split
 
-`split_even(trits, n)` divides trits into n shards as evenly as possible. For N trits and n shards, each shard gets ⌈N/n⌉ or ⌊N/n⌋ trits. The first `N mod n` shards get one extra trit. O(N) to split.
+Given *T* trits and *N* shards, the first `T mod N` shards each get one extra trit:
+
+```
+chunk_size = ⌊T / N⌋
+remainder  = T mod N
+
+shard[i].size = chunk_size + (1 if i < remainder else 0)
+```
+
+**Imbalance factor:**
+
+```
+I = max_size / avg_size
+```
+
+For even split, `I ≤ 1 + 1/avg_size` — approaches 1.0 for large workloads.
+
+**Complexity:** O(T) — single pass with index tracking.
 
 ### Aligned Split
 
-`split_aligned(trits, n)` ensures each shard boundary falls on a 16-trit boundary. Each shard (except the last) gets a multiple of 16 trits. This is critical for packed representation: shards can be directly loaded as u32 arrays without bit manipulation.
+Each shard's size is rounded up to a multiple of 16 (the pack width):
 
 ```
-aligned_base = ⌈(N / n + 15) / 16⌉ × 16
-shard[0..n-1].len = aligned_base
-shard[n-1].len = remaining (may be < aligned_base)
+aligned_base = ⌈(T/N + 15) / 16⌉ × 16
+shard[i].size = aligned_base  (for i < N-1)
+shard[N-1].size = T - offset  (last shard gets remainder)
 ```
+
+This ensures shards 0 through N-2 are perfectly aligned for packed operations. The last shard may be unaligned but contains all remaining data.
+
+**Complexity:** O(T). No padding overhead for the first N-1 shards.
 
 ### Layer-Parallel Sharding
 
-`split_by_layers(layers, n)` distributes entire model layers across devices. Layer i goes to device `i mod n`. This enables pipeline parallelism: device 0 computes layer 0, passes output to device 1 for layer 1, etc. Each device holds only its assigned layers.
+When layers are independent, assign round-robin to devices:
 
-### Shard Metadata
+```
+device(i) = layer[i] mod N
+```
 
-Each `Shard` carries:
-- `shard_id`: Which shard this is (0..n-1)
-- `total_shards`: Total number of shards
-- `trits`: The actual ternary weight data
-- `layer_name`: Which model layer (for layer-parallel)
+This distributes layers cyclically. With *L* layers and *N* devices, each device gets `⌈L/N⌉` or `⌊L/N⌋` layers.
 
-### Reconstruction
+**Complexity:** O(L) assignments.
 
-Concatenating all shards in order reconstructs the original weight tensor. O(N) total.
+### Merge and Validate
+
+Merge sorts shards by `shard_id` and concatenates:
+
+```
+merged = concat(sort_by_id(shards).map(|s| s.trits))
+```
+
+Validate checks `merge(shards) == original`.
+
+**Complexity:** O(S log S + T) for merge (sort + concat), where S = shard count.
 
 ## Quick Start
 
 ```rust
-use ternary_shard_split::{split_even, split_aligned};
+use ternary_shard_split::{split_even, split_aligned, split_by_layers, merge, validate};
 
-let trits: Vec<i8> = (0..1000).map(|i| match i % 3 { 0 => -1, 1 => 0, _ => 1 }).collect();
+let trits: Vec<i8> = (0..100).map(|i| if i % 3 == 0 {1} else if i%3==1 {-1} else {0}).collect();
 
-// Even split across 4 devices
-let shards = split_even(&trits, 4);
-assert_eq!(shards.len(), 4);
-assert_eq!(shards.iter().map(|s| s.trits.len()).sum::<usize>(), 1000);
+// Even split into 7 shards
+let shards = split_even(&trits, 7);
+assert!(validate(&shards, &trits));
 
 // Aligned split (16-trit boundaries)
 let aligned = split_aligned(&trits, 4);
-```
+for s in &aligned[..aligned.len()-1] {
+    assert_eq!(s.trits.len() % 16, 0); // aligned!
+}
 
-```bash
-cargo add ternary-shard-split
+// Layer-parallel
+let layers = vec![
+    ("layer0", vec![1, -1, 0]),
+    ("layer1", vec![0, 1, -1]),
+    ("layer2", vec![1, 1, 1]),
+    ("layer3", vec![-1, -1, -1]),
+];
+let devices = split_by_layers(layers, 2);
+assert_eq!(devices.len(), 2);
 ```
 
 ## API
 
-| Type / Function | Description |
-|---|---|
-| `Shard` | `{ shard_id, total_shards, trits, layer_name }` |
-| `split_even(&[Trit], n)` | Even partition (O(N)) |
-| `split_aligned(&[Trit], n)` | 16-trit aligned partition |
-| `split_by_layers(layers, n)` | Layer-parallel distribution |
+| Function | Description |
+|----------|-------------|
+| `split_even(trits, n)` | Equal-size shards |
+| `split_aligned(trits, n)` | 16-trit-aligned shards |
+| `split_by_layers(layers, n)` | Layer-parallel assignment |
+| `merge(shards)` | Concatenate by shard_id |
+| `validate(shards, original)` | Verify reconstruction |
+| `size_distribution(shards)` | Vec of shard sizes |
+| `imbalance_factor(shards)` | max / avg (1.0 = perfect) |
+
+### Types
+
+```rust
+pub type Trit = i8;
+
+pub struct Shard {
+    pub shard_id: usize,
+    pub total_shards: usize,
+    pub trits: Vec<Trit>,
+    pub layer_name: String,
+}
+```
 
 ## Architecture Notes
 
-Shard split enables multi-GPU training in **SuperInstance**. Each GPU holds a shard of the ternary model; gradients are exchanged between shards during training. The γ + η = C conservation holds per-shard: each shard's active weights (γ) plus zero weights (η) equals the shard size C. Global conservation follows from summing across shards. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+The **γ + η = C** invariant: *generation* (γ) is the split operation producing shard boundaries, *entropy* (η) is the load distribution (measured by `imbalance_factor`), and *conservation* (C) is the invariant that `merge(split(T, N)) == T` — no trit is lost or duplicated during distribution and reconstruction. The `validate` function explicitly checks C. The aligned split additionally preserves a structural invariant: packed-representation alignment for efficient GPU operations.
 
 ## References
 
-- Shazeer, Noam et al. "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer," *ICLR*, 2017.
-- Rajbhandari, Samyam et al. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models," *SC*, 2020.
-| Huang, Yanping et al. "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism," *NeurIPS*, 2019.
-
-
-
-## Complexity Summary
-
-| Operation | Time | Space |
-|---|---|---|
-| split_even(N trits, n shards) | O(N) | O(N) |
-| split_aligned(N trits, n shards) | O(N) | O(N) |
-| split_by_layers(L layers, n devices) | O(L) | O(L) |
-| Reconstruction (concat shards) | O(N) | O(N) |
-
-Aligned splitting adds O(16) padding overhead per shard in the worst case, negligible for models with millions of weights.
+- **Model parallelism:** Shoeybi, M. et al. "Megatron-LM" (2019)
+- **Ternary weight packing:** Alemdar, H. et al. "Ternary Weight Networks" (2017), §3.1
+- **Data parallel sharding:** Li, M. et al. "Scaling Distributed Machine Learning" (2014)
+- **Load balancing theory:** Cybenko, G. "Dynamic Load Balancing" (1989)
 
 ## License
 
